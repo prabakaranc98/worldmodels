@@ -24,3 +24,9 @@ The different paradigms of world modeling currently include:
 
 ### The Causal Perspective
 Additionally, Judea Pearl and the causal inference community emphasize the need for an underlying **Structural Causal Model (SCM)** as the base for a world model. This allows the agent to learn from the SCM in a more causally grounded way. The environment also provides the option to reason at Layer 2 (interventional) and Layer 3 (counterfactual). The latter is particularly important, as counterfactuals remain largely unexplored in other types of environments. However, causal world models currently serve more as theoretical guidance than as concrete model architectures. [Prof. Bareinboim’s Causal RL survey and tutorial is a good place to start.]
+
+
+- [https://worldmodels.github.io/](https://worldmodels.github.io/)
+- [https://arxiv.org/abs/2301.04104](https://arxiv.org/abs/2301.04104)
+- [https://openreview.net/pdf?id=jpiSagi8aV](https://openreview.net/pdf?id=jpiSagi8aV)
+- [https://arxiv.org/html/2402.10877v7](https://arxiv.org/html/2402.10877v7)
