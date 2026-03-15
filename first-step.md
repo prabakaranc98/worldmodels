@@ -1,0 +1,26 @@
+### The Origins of World Models
+The very first idea of a "world model" stemmed from Kenneth Craik’s *The Nature of Explanation*, in which he posits that our brain holds a small-scale model of external reality. Within this model, various actions are conditionally simulated, and the predicted outcomes are validated before being implemented in the physical world. [I feel most of the time we really don’t realize this in our conscious minds; currently, my brain might be running these simulations, predictions, and validations without my consciousness being aware of it. Need to deep dive into this further.] Additionally, there are many related research disciplines that explore this in a more nuanced, quantitative way, such as predictive processing/predictive coding and Active Inference (Karl Friston).
+
+### Formal Adaptation in AI
+The formal adaptation of this concept in AI occurred in the 1990s with Richard Sutton’s **Dyna architecture**, which integrates planning, acting, and learning into a single loop. As a model-based Reinforcement Learning (RL) architecture, it can be considered an early conceptualization of world models. (Note here that Yann LeCun advocates for Model Predictive Control over model-based RL—we will see why shortly.) 
+
+Jürgen Schmidhuber and David Ha were the first to publish the seminal paper explicitly on "World Models" (worldmodels.github.io). [They defined a world model as a predictive neural network that learns a compressed representation of an agent's environment.] Their approach uses generative models to learn the dynamics of the environment and then trains an agent within that learned environment.
+
+### Optimal Control: The Pre-History
+Optimal control is often considered the "pre-history" of world models. While modern AI focuses on learning these models from data, control theory has used mathematical models for decades to achieve specific goals. Fundamentally, scientists and control engineers have used models for planning, or to simulate and validate different control system designs for various systems and plants. [Check: adjoint state methods, which are similar to backpropagation through time.] For an agent to be "optimal" (e.g., using the least fuel or time), it requires an internal representation—a world model—to simulate potential futures.
+
+### Model Predictive Control (MPC) vs. Reinforcement Learning
+A more relevant and immediate ancestor to the current notion of world models is **Model Predictive Control (MPC)**. In MPC, the system uses a model to predict behavior over a specific "horizon," calculates the best series of moves, executes the first move, and then repeats the entire process. 
+
+This encourages thinking from a differentiable systems point of view: given an action or a control input, how will the state change? State-space models in optimal control theory are differentiable, which aligns closely with how Yann LeCun defines a world model. [But why is DreamerV3 considered a non-differentiable world model? Because they use discrete latent states, requiring search or trial-and-error approaches to select the best action, rather than a simple derivative-based approach. Think of how gradients help in neural networks to show where we are heading, serving as the basis for updates and adjustments.]
+
+MPC is often suggested by Yann LeCun as an alternative to model-based RL. He argues that RL is fundamentally sample-inefficient, requires thousands of trial-and-error attempts to learn, lacks the inherent zero-shot planning capabilities of MPC, struggles with zero-shot task solving, and is non-differentiable. LeCun does not view RL as useless, but he believes it should be a "last resort." In his proposed Joint-Embedding Predictive Architecture (JEPA), RL is only used when planning fails to yield the predicted outcome. In this context, it serves as a tool to adjust the world model or the critic, rather than acting as the primary method for decision-making.
+
+### Current Paradigms of World Modeling (As of March 2026)
+The different paradigms of world modeling currently include:
+* **Generative Video World Models (e.g., Genie 3):** Treats video generation as a world modeling task (evolving from the RSSM + VAE + RL combination pioneered by Ha and Schmidhuber).
+* **Spatial Intelligence & Explicit 3D Models (e.g., Fei-Fei Li):** Rejects "flat" video in favor of persistent, navigable 3D environments that act as "virtual training grounds" for robotics.
+* **Latent-Space / Joint-Embedding Models (e.g., JEPA):** Based on Energy-Based Modeling and latent space reconstruction.
+
+### The Causal Perspective
+Additionally, Judea Pearl and the causal inference community emphasize the need for an underlying **Structural Causal Model (SCM)** as the base for a world model. This allows the agent to learn from the SCM in a more causally grounded way. The environment also provides the option to reason at Layer 2 (interventional) and Layer 3 (counterfactual). The latter is particularly important, as counterfactuals remain largely unexplored in other types of environments. However, causal world models currently serve more as theoretical guidance than as concrete model architectures. [Prof. Bareinboim’s Causal RL survey and tutorial is a good place to start.]
