@@ -52,7 +52,7 @@ class ControllerConfig:
     popsize: int = 64             # CMA-ES population size
     max_iter: int = 1000          # max CMA-ES generations
     n_rollouts_per_candidate: int = 16   # rollouts averaged per candidate
-    n_workers: int = 4            # parallel worker processes
+    n_envs: int = -1              # AsyncVectorEnv workers; -1 = os.cpu_count()
     seed: int = 42
     checkpoint_path: str = "./VMC_checkpoints/ctrl_best.pt"
     wandb_project: str = "VMC-Controller"
@@ -128,34 +128,43 @@ class CMAESTrainer:
     """
     Optimises LinearController parameters using CMA-ES.
 
-    The fitness function wraps a user-supplied rollout_fn:
-        rollout_fn(params_flat: np.ndarray, seed: int) → float
+    The fitness function wraps a user-supplied vec_rollout_fn:
 
-    rollout_fn must be a module-level function (picklable for multiprocess).
-    It should load the V+M+C world model internally, run a gym episode,
-    and return total reward.
+        vec_rollout_fn(
+            params_list: list[np.ndarray],   # one params per env
+            seeds: list[int],
+            env_id: str,
+            n_envs: int,
+        ) -> list[float]                     # one reward per env
 
-    Each generation evaluates cfg.popsize candidates, each averaged over
-    cfg.n_rollouts_per_candidate random seeds, using cfg.n_workers workers.
+    Population evaluation uses gymnasium.vector.AsyncVectorEnv — persistent
+    env processes are reused across candidates with no spawn overhead per rollout.
 
     CMA-ES minimises negative reward (convention: minimisation problem).
+    CMA-ES operates entirely in NumPy/float64 (CPU-only).
     """
 
     def __init__(
         self,
         cfg: ControllerConfig,
         controller: LinearController,
-        rollout_fn: Callable[[np.ndarray, int], float],
+        vec_rollout_fn: Callable,
+        env_id: str = "CarRacing-v3",
+        max_steps: int = 1000,
     ):
+        import os
         self.cfg = cfg
         self.controller = controller
-        self.rollout_fn = rollout_fn
+        self.vec_rollout_fn = vec_rollout_fn
+        self.env_id = env_id
+        self.max_steps = max_steps
+        self.n_envs = cfg.n_envs if cfg.n_envs > 0 else os.cpu_count()
 
         self.wandb_run = None
         if _WANDB_AVAILABLE:
             try:
-                import os
-                if os.environ.get("WANDB_MODE") != "disabled":
+                import os as _os
+                if _os.environ.get("WANDB_MODE") != "disabled":
                     self.wandb_run = _wandb.init(
                         project=cfg.wandb_project,
                         name=cfg.wandb_run_name,
@@ -172,8 +181,7 @@ class CMAESTrainer:
         Saves best controller to cfg.checkpoint_path.
         """
         import cma
-        import multiprocess as mp
-        from pathlib import Path
+        from tqdm.auto import tqdm
 
         x0 = self.controller.get_params()
 
@@ -184,81 +192,88 @@ class CMAESTrainer:
                 "popsize": self.cfg.popsize,
                 "seed": self.cfg.seed,
                 "maxiter": self.cfg.max_iter,
-                "verbose": -9,          # suppress cma's own prints
+                "verbose": -9,
             },
         )
 
         best_params = x0.copy()
         best_reward = -np.inf
 
-        with mp.Pool(processes=self.cfg.n_workers) as pool:
-            generation = 0
-            while not es.stop():
-                solutions = es.ask()            # list of np.ndarray (float64)
-                fitnesses = self._evaluate_population(solutions, pool)
+        gen_bar = tqdm(total=self.cfg.max_iter, desc="CMA-ES", unit="gen", dynamic_ncols=True)
+        generation = 0
+        while not es.stop():
+            solutions = es.ask()
+            fitnesses = self._evaluate_population(solutions)
+            es.tell(solutions, fitnesses)
 
-                es.tell(solutions, fitnesses)   # CMA-ES minimises → neg reward
+            rewards = [-f for f in fitnesses]
+            gen_best = max(rewards)
+            gen_mean = float(np.mean(rewards))
 
-                rewards = [-f for f in fitnesses]
-                gen_best = max(rewards)
-                gen_mean = float(np.mean(rewards))
+            if gen_best > best_reward:
+                best_reward = gen_best
+                best_idx = int(np.argmax(rewards))
+                best_params = solutions[best_idx].copy()
+                self._save_checkpoint(best_params, best_reward)
 
-                if gen_best > best_reward:
-                    best_reward = gen_best
-                    best_idx = int(np.argmax(rewards))
-                    best_params = solutions[best_idx].copy()
-                    self._save_checkpoint(best_params, best_reward)
+            gen_bar.set_postfix(best=f"{best_reward:.2f}", mean=f"{gen_mean:.2f}", sigma=f"{es.sigma:.4f}")
+            gen_bar.update(1)
 
-                print(
-                    f"[CMA-ES] gen {generation+1:>4}  "
-                    f"best={best_reward:.2f}  mean={gen_mean:.2f}  "
-                    f"sigma={es.sigma:.4f}"
-                )
+            if self.wandb_run is not None:
+                self.wandb_run.log({
+                    "generation": generation,
+                    "best_reward": best_reward,
+                    "mean_reward": gen_mean,
+                    "sigma": es.sigma,
+                })
 
-                if self.wandb_run is not None:
-                    self.wandb_run.log({
-                        "generation": generation,
-                        "best_reward": best_reward,
-                        "mean_reward": gen_mean,
-                        "sigma": es.sigma,
-                    })
+            generation += 1
 
-                generation += 1
-
+        gen_bar.close()
         if self.wandb_run is not None:
             self.wandb_run.finish()
 
         return best_params, best_reward
 
-    def _evaluate_population(
-        self,
-        population: list[np.ndarray],
-        pool: object,  # multiprocess.Pool
-    ) -> list[float]:
+    def _evaluate_population(self, population: list[np.ndarray]) -> list[float]:
         """
-        Evaluate all candidates in a generation in parallel.
+        Evaluate all candidates using AsyncVectorEnv.
 
-        Each candidate is evaluated cfg.n_rollouts_per_candidate times
-        (different random seeds) and the mean negative reward is returned.
-        CMA-ES minimises, so fitness = -mean_reward.
+        Each candidate runs n_rollouts_per_candidate episodes. Rollouts for
+        all candidates are batched and dispatched to persistent env workers
+        in chunks of n_envs — no process spawn overhead between candidates.
+
+        Returns fitness = -mean_reward per candidate (CMA-ES minimises).
         """
-        # Build (params, seed) argument list for each (candidate, rollout) pair
-        args: list[tuple[np.ndarray, int]] = []
-        for candidate in population:
+        n_cands = len(population)
+        n_r = self.cfg.n_rollouts_per_candidate
+
+        # Build flat list of (params, seed) for every (candidate × rollout)
+        all_params: list[np.ndarray] = []
+        all_seeds: list[int] = []
+        for i, candidate in enumerate(population):
             base_seed = int(self.cfg.seed + hash(candidate.tobytes()) & 0xFFFF)
-            for r in range(self.cfg.n_rollouts_per_candidate):
-                args.append((candidate, base_seed + r))
+            for r in range(n_r):
+                all_params.append(candidate)
+                all_seeds.append(base_seed + r)
 
-        # Parallel evaluation
-        rewards = pool.starmap(self.rollout_fn, args)
+        total = len(all_params)   # n_cands × n_r
+
+        # Dispatch in chunks of n_envs to the vectorised env
+        all_rewards: list[float] = []
+        for start in range(0, total, self.n_envs):
+            chunk_params = all_params[start : start + self.n_envs]
+            chunk_seeds  = all_seeds[start : start + self.n_envs]
+            rewards = self.vec_rollout_fn(
+                chunk_params, chunk_seeds, self.env_id, len(chunk_params), self.max_steps,
+            )
+            all_rewards.extend(rewards)
 
         # Average over rollouts per candidate → negate for minimisation
-        n = self.cfg.n_rollouts_per_candidate
         fitnesses = []
-        for i in range(len(population)):
-            mean_reward = float(np.mean(rewards[i * n : (i + 1) * n]))
-            fitnesses.append(-mean_reward)
-
+        for i in range(n_cands):
+            mean_r = float(np.mean(all_rewards[i * n_r : (i + 1) * n_r]))
+            fitnesses.append(-mean_r)
         return fitnesses
 
     def _save_checkpoint(self, params: np.ndarray, reward: float) -> None:

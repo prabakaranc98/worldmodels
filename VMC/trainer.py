@@ -28,7 +28,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from tqdm.auto import tqdm
 
-from .data import DataConfig, FrameDataset, SequenceDataset
+from .data import DataConfig, FrameDataset, SequenceDataset, h5_worker_init_fn
+from .distributed import DistConfig, all_reduce_dict, build_sampler, get_local_rank, is_main, wrap_model
 from .memory import MDNRNN, MDNRNNConfig
 from .vision import BetaVAE, VAEConfig
 
@@ -44,12 +45,23 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def get_device() -> torch.device:
-    """Auto-select MPS > CUDA > CPU."""
+    """Auto-select MPS > CUDA > CPU (single-process)."""
     if torch.backends.mps.is_available():
         return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def _get_device_for_dist(dist_cfg: DistConfig) -> torch.device:
+    """
+    Rank-aware device selection.
+    Distributed: assign each rank its own cuda:<local_rank> GPU.
+    Single process: fall back to auto-select (MPS / CUDA / CPU).
+    """
+    if dist_cfg.strategy != "none" and torch.cuda.is_available():
+        return torch.device(f"cuda:{get_local_rank()}")
+    return get_device()
 
 
 def _try_compile(model: nn.Module) -> nn.Module:
@@ -73,7 +85,9 @@ def _try_compile(model: nn.Module) -> nn.Module:
 class VAETrainerConfig:
     vae_cfg: VAEConfig = field(default_factory=VAEConfig)
     data_cfg: DataConfig = field(default_factory=DataConfig)
+    dist_cfg: DistConfig = field(default_factory=DistConfig)
     batch_size: int = 64
+    num_workers: int = 4              # DataLoader workers (h5_worker_init_fn makes this safe)
     epochs: int = 50
     lr: float = 1e-4
     val_split: float = 0.1
@@ -97,14 +111,16 @@ class VAETrainer:
 
     def __init__(self, cfg: VAETrainerConfig):
         self.cfg = cfg
-        self.device = get_device()
-        print(f"[VAETrainer] device: {self.device}")
+        self.device = _get_device_for_dist(cfg.dist_cfg)
+        if is_main():
+            print(f"[VAETrainer] device: {self.device}  strategy: {cfg.dist_cfg.strategy}")
 
         Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
         self.model = BetaVAE(cfg.vae_cfg).to(self.device)
         if cfg.use_compile:
             self.model = _try_compile(self.model)
+        self.model = wrap_model(self.model, cfg.dist_cfg, self.device)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
 
@@ -115,11 +131,23 @@ class VAETrainer:
             dataset, [n_train, n_val],
             generator=torch.Generator().manual_seed(42),
         )
-        self.train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
-        self.val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+        train_sampler = build_sampler(train_ds, shuffle=True,  cfg=cfg.dist_cfg)
+        val_sampler   = build_sampler(val_ds,   shuffle=False, cfg=cfg.dist_cfg)
+        pin = self.device.type == "cuda"
+        self.train_loader = DataLoader(
+            train_ds, sampler=train_sampler, batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers, pin_memory=pin,
+            worker_init_fn=h5_worker_init_fn,
+        )
+        self.val_loader = DataLoader(
+            val_ds, sampler=val_sampler, batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers, pin_memory=pin,
+            worker_init_fn=h5_worker_init_fn,
+        )
+        self._train_sampler = train_sampler
 
         self.wandb_run = None
-        if _WANDB_AVAILABLE and os.environ.get("WANDB_MODE") != "disabled":
+        if is_main() and _WANDB_AVAILABLE and os.environ.get("WANDB_MODE") != "disabled":
             try:
                 self.wandb_run = _wandb.init(
                     project=cfg.wandb_project,
@@ -136,8 +164,13 @@ class VAETrainer:
         epoch_bar = tqdm(
             range(self._start_epoch, self.cfg.epochs),
             desc="VAE", unit="epoch", dynamic_ncols=True,
+            disable=not is_main(),   # only rank 0 shows the bar
         )
         for epoch in epoch_bar:
+            # tell DistributedSampler which epoch we're in (different shuffle per epoch)
+            if hasattr(self._train_sampler, "set_epoch"):
+                self._train_sampler.set_epoch(epoch)
+
             self.model.train()
             train_metrics = self._run_epoch(self.train_loader, train=True)
 
@@ -149,18 +182,18 @@ class VAETrainer:
             metrics.update({f"val/{k}": v for k, v in val_metrics.items()})
             metrics["epoch"] = epoch
 
-            epoch_bar.set_postfix(
-                train=f"{train_metrics['total']:.4f}",
-                val=f"{val_metrics['total']:.4f}",
-            )
+            if is_main():
+                epoch_bar.set_postfix(
+                    train=f"{train_metrics['total']:.4f}",
+                    val=f"{val_metrics['total']:.4f}",
+                )
+                if self.wandb_run is not None:
+                    self.wandb_run.log(metrics)
+                    if (epoch + 1) % self.cfg.log_recon_every == 0:
+                        self._log_reconstructions(epoch)
 
-            if self.wandb_run is not None:
-                self.wandb_run.log(metrics)
-                if (epoch + 1) % self.cfg.log_recon_every == 0:
-                    self._log_reconstructions(epoch)
-
-            if (epoch + 1) % self.cfg.checkpoint_every == 0:
-                self._save_checkpoint(epoch, val_metrics)
+                if (epoch + 1) % self.cfg.checkpoint_every == 0:
+                    self._save_checkpoint(epoch, val_metrics)
 
         self._save_checkpoint(self.cfg.epochs - 1, val_metrics, final=True)
         if self.wandb_run is not None:
@@ -172,7 +205,7 @@ class VAETrainer:
         totals: dict[str, float] = {"recon": 0.0, "kl": 0.0, "total": 0.0}
         n = 0
         desc = "train" if train else "val"
-        for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
+        for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not is_main()):
             if isinstance(batch, (list, tuple)):
                 batch = batch[0]
             x = batch.to(self.device)
@@ -191,7 +224,8 @@ class VAETrainer:
                 totals[k] += v.item() * x.size(0)
             n += x.size(0)
 
-        return {k: v / n for k, v in totals.items()}
+        raw = {k: v / n for k, v in totals.items()}
+        return all_reduce_dict(raw, self.device)
 
     def _log_reconstructions(self, epoch: int) -> None:
         """Log a side-by-side grid of originals and reconstructions to wandb."""
@@ -215,11 +249,15 @@ class VAETrainer:
     def _save_checkpoint(
         self, epoch: int, metrics: dict[str, float], final: bool = False
     ) -> None:
+        if not is_main():
+            return   # only rank 0 writes checkpoints
         tag = "final" if final else f"epoch_{epoch+1:04d}"
         path = Path(self.cfg.checkpoint_dir) / f"vae_{tag}.pt"
+        # unwrap DDP/FSDP to get the raw module's state_dict
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
         torch.save(
             {
-                "model_state_dict": self.model.state_dict(),
+                "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "epoch": epoch,
                 "config": dataclasses.asdict(self.cfg),
@@ -249,9 +287,11 @@ class VAETrainer:
 class MDNRNNTrainerConfig:
     mdn_cfg: MDNRNNConfig = field(default_factory=MDNRNNConfig)
     data_cfg: DataConfig = field(default_factory=DataConfig)
+    dist_cfg: DistConfig = field(default_factory=DistConfig)
     seq_len: int = 32
     seq_stride: int | None = None     # None → seq_len // 2
     batch_size: int = 32
+    num_workers: int = 0              # SequenceDataset is in-memory; 0 is optimal
     epochs: int = 30
     lr: float = 1e-3
     val_split: float = 0.1
@@ -277,14 +317,16 @@ class MDNRNNTrainer:
 
     def __init__(self, cfg: MDNRNNTrainerConfig):
         self.cfg = cfg
-        self.device = get_device()
-        print(f"[MDNRNNTrainer] device: {self.device}")
+        self.device = _get_device_for_dist(cfg.dist_cfg)
+        if is_main():
+            print(f"[MDNRNNTrainer] device: {self.device}  strategy: {cfg.dist_cfg.strategy}")
 
         Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
         self.model = MDNRNN(cfg.mdn_cfg).to(self.device)
         if cfg.use_compile:
             self.model = _try_compile(self.model)
+        self.model = wrap_model(self.model, cfg.dist_cfg, self.device)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
 
@@ -299,11 +341,21 @@ class MDNRNNTrainer:
             dataset, [n_train, n_val],
             generator=torch.Generator().manual_seed(42),
         )
-        self.train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
-        self.val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+        train_sampler = build_sampler(train_ds, shuffle=True,  cfg=cfg.dist_cfg)
+        val_sampler   = build_sampler(val_ds,   shuffle=False, cfg=cfg.dist_cfg)
+        pin = self.device.type == "cuda"
+        self.train_loader = DataLoader(
+            train_ds, sampler=train_sampler, batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers, pin_memory=pin,
+        )
+        self.val_loader = DataLoader(
+            val_ds, sampler=val_sampler, batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers, pin_memory=pin,
+        )
+        self._train_sampler = train_sampler
 
         self.wandb_run = None
-        if _WANDB_AVAILABLE and os.environ.get("WANDB_MODE") != "disabled":
+        if is_main() and _WANDB_AVAILABLE and os.environ.get("WANDB_MODE") != "disabled":
             try:
                 self.wandb_run = _wandb.init(
                     project=cfg.wandb_project,
@@ -320,8 +372,12 @@ class MDNRNNTrainer:
         epoch_bar = tqdm(
             range(self._start_epoch, self.cfg.epochs),
             desc="MDN", unit="epoch", dynamic_ncols=True,
+            disable=not is_main(),
         )
         for epoch in epoch_bar:
+            if hasattr(self._train_sampler, "set_epoch"):
+                self._train_sampler.set_epoch(epoch)
+
             self.model.train()
             train_metrics = self._run_epoch(self.train_loader, train=True)
 
@@ -333,16 +389,16 @@ class MDNRNNTrainer:
             metrics.update({f"val/{k}": v for k, v in val_metrics.items()})
             metrics["epoch"] = epoch
 
-            epoch_bar.set_postfix(
-                train_nll=f"{train_metrics['nll']:.4f}",
-                val_nll=f"{val_metrics['nll']:.4f}",
-            )
+            if is_main():
+                epoch_bar.set_postfix(
+                    train_nll=f"{train_metrics['nll']:.4f}",
+                    val_nll=f"{val_metrics['nll']:.4f}",
+                )
+                if self.wandb_run is not None:
+                    self.wandb_run.log(metrics)
 
-            if self.wandb_run is not None:
-                self.wandb_run.log(metrics)
-
-            if (epoch + 1) % self.cfg.checkpoint_every == 0:
-                self._save_checkpoint(epoch, val_metrics)
+                if (epoch + 1) % self.cfg.checkpoint_every == 0:
+                    self._save_checkpoint(epoch, val_metrics)
 
         self._save_checkpoint(self.cfg.epochs - 1, val_metrics, final=True)
         if self.wandb_run is not None:
@@ -354,7 +410,7 @@ class MDNRNNTrainer:
         totals: dict[str, float] = {"nll": 0.0, "done": 0.0, "total": 0.0}
         n = 0
         desc = "train" if train else "val"
-        for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
+        for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not is_main()):
             z = batch["z"].to(self.device)
             a = batch["a"].to(self.device)
             z_next = batch["z_next"].to(self.device)
@@ -377,16 +433,20 @@ class MDNRNNTrainer:
                 totals[k] += v.item() * bs
             n += bs
 
-        return {k: v / n for k, v in totals.items()}
+        raw = {k: v / n for k, v in totals.items()}
+        return all_reduce_dict(raw, self.device)
 
     def _save_checkpoint(
         self, epoch: int, metrics: dict[str, float], final: bool = False
     ) -> None:
+        if not is_main():
+            return
         tag = "final" if final else f"epoch_{epoch+1:04d}"
         path = Path(self.cfg.checkpoint_dir) / f"mdn_{tag}.pt"
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
         torch.save(
             {
-                "model_state_dict": self.model.state_dict(),
+                "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "epoch": epoch,
                 "config": dataclasses.asdict(self.cfg),

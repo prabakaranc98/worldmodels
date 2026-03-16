@@ -99,10 +99,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sigma0", type=float, default=0.1)
     p.add_argument("--n_rollouts", type=int, default=16,
                    help="Rollouts averaged per CMA-ES candidate.")
+    p.add_argument("--n_envs", type=int, default=-1,
+                   help="AsyncVectorEnv workers for CMA-ES evaluation. -1 = os.cpu_count().")
     p.add_argument("--vae_ckpt", type=str, default=None,
                    help="VAE checkpoint for controller rollouts (auto-detected if omitted).")
     p.add_argument("--mdn_ckpt", type=str, default=None,
                    help="MDN checkpoint for controller rollouts (auto-detected if omitted).")
+
+    # --- Distributed training ---
+    p.add_argument("--dist_strategy", choices=["none", "ddp", "fsdp"], default="none",
+                   help="Distributed strategy. Use with torchrun for ddp/fsdp.")
+    p.add_argument("--dist_backend", choices=["nccl", "gloo"], default="nccl",
+                   help="Distributed backend. Use gloo for CPU/MPS, nccl for CUDA.")
 
     return p
 
@@ -154,10 +162,15 @@ def _make_ctrl_cfg(args: argparse.Namespace):
         popsize=args.popsize,
         max_iter=args.max_iter,
         n_rollouts_per_candidate=args.n_rollouts,
-        n_workers=args.n_workers,
+        n_envs=args.n_envs,
         seed=args.seed,
         checkpoint_path=str(Path(args.checkpoint_dir) / "ctrl_best.pt"),
     )
+
+
+def _make_dist_cfg(args: argparse.Namespace):
+    from .distributed import DistConfig
+    return DistConfig(strategy=args.dist_strategy, backend=args.dist_backend)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +195,7 @@ def phase_train_vae(args: argparse.Namespace) -> None:
     cfg = VAETrainerConfig(
         vae_cfg=_make_vae_cfg(args),
         data_cfg=_make_data_cfg(args),
+        dist_cfg=_make_dist_cfg(args),
         epochs=args.vae_epochs,
         lr=args.vae_lr,
         batch_size=args.vae_batch,
@@ -230,6 +244,7 @@ def phase_train_mdn(args: argparse.Namespace) -> None:
     cfg = MDNRNNTrainerConfig(
         mdn_cfg=_make_mdn_cfg(args),
         data_cfg=_make_data_cfg(args),
+        dist_cfg=_make_dist_cfg(args),
         seq_len=args.seq_len,
         epochs=args.mdn_epochs,
         lr=args.mdn_lr,
@@ -285,7 +300,19 @@ def phase_train_ctrl(args: argparse.Namespace) -> None:
         max_steps=args.max_steps,
     )
 
-    trainer = CMAESTrainer(ctrl_cfg, ctrl, rollout_fn=rollout_fn)
+    trainer = CMAESTrainer(
+        ctrl_cfg, ctrl,
+        vec_rollout_fn=_make_vec_rollout_fn(
+            vae_ckpt=vae_ckpt,
+            mdn_ckpt=mdn_ckpt,
+            vae_cfg_kwargs=dict(img_channels=3, img_size=args.img_size, z_dim=args.z_dim, beta=args.beta),
+            mdn_cfg_kwargs=dict(z_dim=args.z_dim, action_dim=args.action_dim,
+                                hidden_size=args.hidden_size, num_mixtures=args.num_mixtures),
+            ctrl_cfg_kwargs=ctrl_cfg.__dict__.copy(),
+        ),
+        env_id=args.env_id,
+        max_steps=args.max_steps,
+    )
     best_params, best_reward = trainer.train()
     print(f"\nController training done. Best reward: {best_reward:.2f}")
 
@@ -294,28 +321,35 @@ def phase_train_ctrl(args: argparse.Namespace) -> None:
 # Rollout function factory (module-level for pickling)
 # ---------------------------------------------------------------------------
 
-def _make_rollout_fn(
+def _make_vec_rollout_fn(
     vae_ckpt: str,
     mdn_ckpt: str,
     vae_cfg_kwargs: dict,
     mdn_cfg_kwargs: dict,
     ctrl_cfg_kwargs: dict,
-    env_id: str,
-    max_steps: int,
 ):
     """
-    Return a module-level-compatible rollout function for CMA-ES workers.
+    Return a vectorised rollout function for CMAESTrainer.
 
-    Returns a closure; multiprocess (Dill) handles closure serialisation on macOS.
-    Each worker call:
-        1. Loads V+M from checkpoints (cached per-process after first load)
-        2. Sets controller params from flat numpy vector
-        3. Runs one gymnasium episode
-        4. Returns total reward
+    Signature:
+        vec_rollout_fn(params_list, seeds, env_id, n_envs, max_steps) → list[float]
+
+    Uses gymnasium.vector.AsyncVectorEnv — persistent env subprocesses shared
+    across all calls for a generation. Each call steps `n_envs` envs in parallel
+    with their respective controller params until all episodes are done.
+
+    Dill (multiprocess) serialises the closure correctly on macOS/spawn.
     """
 
-    def rollout_fn(params_flat, seed: int) -> float:
+    def vec_rollout_fn(
+        params_list: list,
+        seeds: list,
+        env_id: str,
+        n_envs: int,
+        max_steps: int,
+    ) -> list[float]:
         import gymnasium as gym
+        import numpy as np
         import torch
 
         from VMC.controller import ControllerConfig, LinearController
@@ -323,35 +357,58 @@ def _make_rollout_fn(
         from VMC.model import WorldModel, WorldModelConfig
         from VMC.vision import BetaVAE, VAEConfig
 
-        vae_cfg = VAEConfig(**vae_cfg_kwargs)
-        mdn_cfg = MDNRNNConfig(**mdn_cfg_kwargs)
-        ctrl_cfg = ControllerConfig(**ctrl_cfg_kwargs)
+        # Build one WorldModel per env (each carries its own LSTM hidden state)
+        def make_wm(params_flat):
+            vae_cfg = VAEConfig(**vae_cfg_kwargs)
+            mdn_cfg = MDNRNNConfig(**mdn_cfg_kwargs)
+            ctrl_cfg = ControllerConfig(**ctrl_cfg_kwargs)
+            wm_cfg = WorldModelConfig(vae_cfg=vae_cfg, mdn_cfg=mdn_cfg, ctrl_cfg=ctrl_cfg)
+            wm = WorldModel.from_checkpoints(
+                vae_ckpt, mdn_ckpt,
+                ctrl_path=ctrl_cfg_kwargs.get("checkpoint_path", ""),
+                cfg=wm_cfg,
+            )
+            wm.ctrl.set_params(params_flat)
+            wm.ctrl.eval()
+            wm.reset()
+            return wm
 
-        wm_cfg = WorldModelConfig(vae_cfg=vae_cfg, mdn_cfg=mdn_cfg, ctrl_cfg=ctrl_cfg)
-        wm = WorldModel.from_checkpoints(vae_ckpt, mdn_ckpt,
-                                         # use a dummy ctrl path (we set params directly)
-                                         ctrl_path=ctrl_cfg_kwargs.get("checkpoint_path", ""),
-                                         cfg=wm_cfg)
-        # override controller params from CMA-ES candidate
-        wm.ctrl.set_params(params_flat)
-        wm.ctrl.eval()
+        world_models = [make_wm(p) for p in params_list]
 
-        env = gym.make(env_id)
-        obs, _ = env.reset(seed=seed)
-        wm.reset()
+        # Persistent vectorised envs — no spawn overhead between candidates
+        envs = gym.vector.AsyncVectorEnv([
+            (lambda s=seeds[i]: lambda: gym.make(env_id))()   # one factory per env
+            for i in range(n_envs)
+        ])
 
-        total = 0.0
+        obs_batch, _ = envs.reset(seed=seeds)  # (n_envs, H, W, C)
+        totals = [0.0] * n_envs
+        dones = [False] * n_envs
+
         for _ in range(max_steps):
-            action, _, _ = wm.step(obs)
-            obs, reward, terminated, truncated, _ = env.step(action)
-            total += float(reward)
-            if terminated or truncated:
+            if all(dones):
                 break
 
-        env.close()
-        return total
+            actions = []
+            for i, (wm, obs) in enumerate(zip(world_models, obs_batch)):
+                if dones[i]:
+                    actions.append(envs.action_space.sample()[:1][0])  # dummy action
+                else:
+                    action, _, _ = wm.step(obs)
+                    actions.append(action)
 
-    return rollout_fn
+            obs_batch, rewards, terminated, truncated, _ = envs.step(np.array(actions))
+
+            for i in range(n_envs):
+                if not dones[i]:
+                    totals[i] += float(rewards[i])
+                    if terminated[i] or truncated[i]:
+                        dones[i] = True
+
+        envs.close()
+        return totals
+
+    return vec_rollout_fn
 
 
 # ---------------------------------------------------------------------------
@@ -387,17 +444,27 @@ ALL_PHASES = ["collect", "train_vae", "encode", "train_mdn", "train_ctrl"]
 
 
 def main(argv: list[str] | None = None) -> None:
+    from .distributed import cleanup, init_process_group, is_main
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    phases = ALL_PHASES if args.all else args.phases
+    dist_cfg = _make_dist_cfg(args)
+    init_process_group(dist_cfg)   # no-op when strategy="none"
 
-    print(f"VMC Training — phases: {phases}")
+    try:
+        phases = ALL_PHASES if args.all else args.phases
 
-    for phase in phases:
-        PHASE_MAP[phase](args)
+        if is_main():
+            print(f"VMC Training — phases: {phases}  dist: {dist_cfg.strategy}")
 
-    print("\nAll requested phases complete.")
+        for phase in phases:
+            PHASE_MAP[phase](args)
+
+        if is_main():
+            print("\nAll requested phases complete.")
+    finally:
+        cleanup()   # no-op when not distributed
 
 
 if __name__ == "__main__":

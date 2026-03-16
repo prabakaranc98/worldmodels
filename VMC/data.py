@@ -42,6 +42,31 @@ import torch
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
+
+# ---------------------------------------------------------------------------
+# DataLoader worker init — h5py fork-safety fix
+# ---------------------------------------------------------------------------
+
+def h5_worker_init_fn(worker_id: int) -> None:
+    """
+    Reopen h5py file handle inside each DataLoader worker after fork.
+
+    h5py file handles are not fork-safe — forked workers inherit the parent's
+    handle which becomes invalid.  Pass this as worker_init_fn to DataLoader
+    when using num_workers > 0 with FrameDataset.
+
+    Handles torch.utils.data.Subset transparently (val split wraps the dataset).
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        return  # called in main process — no-op
+    ds = worker_info.dataset
+    # unwrap Subset (created by random_split)
+    if hasattr(ds, "dataset"):
+        ds = ds.dataset
+    if hasattr(ds, "_h5_path"):
+        ds._h5 = h5py.File(ds._h5_path, "r")
+
 if TYPE_CHECKING:
     from .vision import BaseVAE
 
