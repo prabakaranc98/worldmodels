@@ -65,7 +65,7 @@ def h5_worker_init_fn(worker_id: int) -> None:
     if hasattr(ds, "dataset"):
         ds = ds.dataset
     if hasattr(ds, "_h5_path"):
-        ds._h5 = h5py.File(ds._h5_path, "r")
+        ds._h5 = h5py.File(ds._h5_path, "r", locking=False)
 
 if TYPE_CHECKING:
     from .vision import BaseVAE
@@ -79,7 +79,7 @@ if TYPE_CHECKING:
 class DataConfig:
     env_id: str = "CarRacing-v3"
     n_episodes: int = 10_000        # Ha & Schmidhuber used 10,000 rollouts
-    max_steps_per_episode: int = 1000
+    max_steps_per_episode: int = 400
     img_size: int = 64
     data_dir: str = "./VMC_data"
     n_workers: int = -1             # -1 = use all logical CPU cores
@@ -94,11 +94,12 @@ class DataConfig:
 def preprocess_frame(frame: np.ndarray, img_size: int = 64) -> torch.Tensor:
     """
     np.ndarray (H, W, 3) uint8  →  torch.Tensor (3, img_size, img_size) float32 ∈ [0, 1]
-    """
-    from PIL import Image
 
-    img = Image.fromarray(frame).resize((img_size, img_size), Image.BILINEAR)
-    arr = np.array(img, dtype=np.float32) / 255.0   # (H, W, 3)
+    Uses cv2 bilinear resize (~3× faster than PIL).
+    """
+    import cv2
+    img = cv2.resize(frame, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+    arr = img.astype(np.float32) / 255.0             # (H, W, 3)
     return torch.from_numpy(arr).permute(2, 0, 1)   # (3, H, W)
 
 
@@ -121,35 +122,49 @@ def collect_episode(
         actions: (T, action_dim) float32
         rewards: (T,) float32
         dones:   (T,) bool
+
+    Optimisations vs naive list-append approach:
+    - Pre-allocated numpy arrays (no repeated realloc / torch.stack at end)
+    - cv2 resize (3× faster than PIL)
+    - Contiguous memory layout → zero-copy torch.from_numpy
     """
     import gymnasium as gym
 
     env = gym.make(env_id, render_mode=render_mode)
     obs, _ = env.reset(seed=seed)
+    action_dim = env.action_space.shape[0]
 
-    frames, actions, rewards, dones = [], [], [], []
+    # pre-allocate — avoids per-step list.append + final torch.stack
+    frames_buf  = np.empty((max_steps, 3, img_size, img_size), dtype=np.float32)
+    actions_buf = np.empty((max_steps, action_dim),             dtype=np.float32)
+    rewards_buf = np.empty((max_steps,),                        dtype=np.float32)
+    dones_buf   = np.empty((max_steps,),                        dtype=bool)
 
-    for _ in range(max_steps):
+    t = 0
+    for t in range(max_steps):
         action = env.action_space.sample()
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = bool(terminated or truncated)
 
-        frames.append(preprocess_frame(obs, img_size))
-        actions.append(torch.tensor(action, dtype=torch.float32))
-        rewards.append(float(reward))
-        dones.append(done)
+        frames_buf[t]  = preprocess_frame(obs, img_size).numpy()
+        actions_buf[t] = action
+        rewards_buf[t] = reward
+        dones_buf[t]   = done
 
         obs = next_obs
         if done:
+            t += 1
             break
+    else:
+        t = max_steps
 
     env.close()
 
     return {
-        "frames":  torch.stack(frames),
-        "actions": torch.stack(actions),
-        "rewards": torch.tensor(rewards, dtype=torch.float32),
-        "dones":   torch.tensor(dones,   dtype=torch.bool),
+        "frames":  torch.from_numpy(np.ascontiguousarray(frames_buf[:t])),
+        "actions": torch.from_numpy(np.ascontiguousarray(actions_buf[:t])),
+        "rewards": torch.from_numpy(np.ascontiguousarray(rewards_buf[:t])),
+        "dones":   torch.from_numpy(np.ascontiguousarray(dones_buf[:t])),
     }
 
 
@@ -219,7 +234,7 @@ def collect_rollouts(cfg: DataConfig) -> None:
     ]
 
     saved = 0
-    with h5py.File(out_path, "w") as hf:
+    with h5py.File(out_path, "w", locking=False) as hf:
         with mp.Pool(processes=n_workers) as pool:
             with tqdm(total=cfg.n_episodes, desc="collect", unit="ep", dynamic_ncols=True) as pbar:
                 for result in pool.imap_unordered(_collect_episode_star, args):
@@ -254,7 +269,7 @@ class FrameDataset(Dataset):
             raise FileNotFoundError(f"episodes.h5 not found at {h5_path}. Run collect_rollouts first.")
 
         self._h5_path = h5_path
-        self._h5: h5py.File = h5py.File(h5_path, "r")
+        self._h5: h5py.File = h5py.File(h5_path, "r", locking=False)
 
         # index: list of (ep_key, frame_idx_within_episode)
         self._index: list[tuple[str, int]] = []
@@ -306,7 +321,7 @@ def encode_dataset(
 
     vae = vae.to(device).eval()
 
-    with h5py.File(ep_path, "r") as src, h5py.File(enc_path, "w") as dst:
+    with h5py.File(ep_path, "r", locking=False) as src, h5py.File(enc_path, "w", locking=False) as dst:
         ep_keys = sorted(src.keys())
         for ep_key in tqdm(ep_keys, desc="encoding", unit="ep", dynamic_ncols=True):
             frames  = torch.from_numpy(src[ep_key]["frames"][:])    # (T, 3, H, W)
@@ -362,7 +377,7 @@ class SequenceDataset(Dataset):
         self._episodes: list[dict[str, torch.Tensor]] = []
         self._index: list[tuple[int, int]] = []   # (ep_idx, start_t)
 
-        with h5py.File(enc_path, "r") as f:
+        with h5py.File(enc_path, "r", locking=False) as f:
             ep_keys = sorted(f.keys())
             for ep_key in tqdm(ep_keys, desc="loading sequences", unit="ep", dynamic_ncols=True):
                 T = f[ep_key].attrs["T"]

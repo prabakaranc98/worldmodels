@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- Data collection ---
     p.add_argument("--n_episodes", type=int, default=10_000)
-    p.add_argument("--max_steps", type=int, default=1000)
+    p.add_argument("--max_steps", type=int, default=400)
     p.add_argument("--n_workers", type=int, default=-1,
                    help="Parallel workers for collect + CMA-ES. -1 = all CPU cores.")
     p.add_argument("--seed", type=int, default=0)

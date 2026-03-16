@@ -13,6 +13,7 @@ dependencies = [
     "jupyterlab>=4.5.6",
     "multiprocess>=0.70.18",
     "numpy>=2.0.0",
+    "opencv-python-headless>=4.13.0.92",
     "safetensors>=0.7.0",
     "torch>=2.10.0",
     "torchvision>=0.25.0",
