@@ -96,6 +96,8 @@ class VAETrainerConfig:
     use_compile: bool = True
     wandb_project: str = "VMC-VAE"
     wandb_run_name: str | None = None
+    ssim_weight: float = 0.5          # weight for SSIM term in recon loss (MSE + ssim_weight*(1-SSIM))
+    log_every_n_steps: int = 50       # log running loss to wandb every N batches
     log_recon_every: int = 10         # log reconstruction images every N epochs
 
 
@@ -166,17 +168,20 @@ class VAETrainer:
             desc="VAE", unit="epoch", dynamic_ncols=True,
             disable=not is_main(),   # only rank 0 shows the bar
         )
+        global_step = self._start_epoch * len(self.train_loader)
         for epoch in epoch_bar:
             # tell DistributedSampler which epoch we're in (different shuffle per epoch)
             if hasattr(self._train_sampler, "set_epoch"):
                 self._train_sampler.set_epoch(epoch)
 
             self.model.train()
-            train_metrics = self._run_epoch(self.train_loader, train=True)
+            train_metrics, global_step = self._run_epoch(
+                self.train_loader, train=True, epoch=epoch, global_step=global_step
+            )
 
             self.model.eval()
             with torch.no_grad():
-                val_metrics = self._run_epoch(self.val_loader, train=False)
+                val_metrics, _ = self._run_epoch(self.val_loader, train=False)
 
             metrics = {f"train/{k}": v for k, v in train_metrics.items()}
             metrics.update({f"val/{k}": v for k, v in val_metrics.items()})
@@ -184,7 +189,9 @@ class VAETrainer:
 
             if is_main():
                 epoch_bar.set_postfix(
-                    train=f"{train_metrics['total']:.4f}",
+                    mse=f"{train_metrics['mse']:.4f}",
+                    ssim=f"{train_metrics['ssim']:.3f}",
+                    kl=f"{train_metrics['kl']:.4f}",
                     val=f"{val_metrics['total']:.4f}",
                 )
                 if self.wandb_run is not None:
@@ -201,11 +208,13 @@ class VAETrainer:
 
         return self.model.cpu()
 
-    def _run_epoch(self, loader: DataLoader, *, train: bool) -> dict[str, float]:
-        totals: dict[str, float] = {"recon": 0.0, "kl": 0.0, "total": 0.0}
+    def _run_epoch(
+        self, loader: DataLoader, *, train: bool, epoch: int = 0, global_step: int = 0
+    ) -> tuple[dict[str, float], int]:
+        totals: dict[str, float] = {"mse": 0.0, "ssim": 0.0, "recon": 0.0, "kl": 0.0, "total": 0.0}
         n = 0
         desc = "train" if train else "val"
-        for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not is_main()):
+        for step, batch in enumerate(tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not is_main())):
             if isinstance(batch, (list, tuple)):
                 batch = batch[0]
             x = batch.to(self.device)
@@ -214,7 +223,7 @@ class VAETrainer:
                 self.optimizer.zero_grad()
 
             out = self.model(x)
-            losses = BetaVAE.loss(out, x, self.cfg.vae_cfg.beta)
+            losses = BetaVAE.loss(out, x, self.cfg.vae_cfg.beta, self.cfg.ssim_weight)
 
             if train:
                 losses["total"].backward()
@@ -224,8 +233,20 @@ class VAETrainer:
                 totals[k] += v.item() * x.size(0)
             n += x.size(0)
 
+            # step-level wandb logging (train only, rank 0 only)
+            if train and is_main() and self.wandb_run is not None:
+                if (step + 1) % self.cfg.log_every_n_steps == 0:
+                    self.wandb_run.log({
+                        "step/mse":   losses["mse"].item(),
+                        "step/ssim":  losses["ssim"].item(),
+                        "step/recon": losses["recon"].item(),
+                        "step/kl":    losses["kl"].item(),
+                        "step/total": losses["total"].item(),
+                        "global_step": global_step + step,
+                    })
+
         raw = {k: v / n for k, v in totals.items()}
-        return all_reduce_dict(raw, self.device)
+        return all_reduce_dict(raw, self.device), global_step + len(loader)
 
     def _log_reconstructions(self, epoch: int) -> None:
         """Log a side-by-side grid of originals and reconstructions to wandb."""
@@ -300,6 +321,7 @@ class MDNRNNTrainerConfig:
     use_compile: bool = True
     wandb_project: str = "VMC-MDN"
     wandb_run_name: str | None = None
+    log_every_n_steps: int = 50       # log running loss to wandb every N batches
     grad_clip: float = 1.0            # gradient clipping (important for RNNs)
 
 
@@ -374,16 +396,19 @@ class MDNRNNTrainer:
             desc="MDN", unit="epoch", dynamic_ncols=True,
             disable=not is_main(),
         )
+        global_step = self._start_epoch * len(self.train_loader)
         for epoch in epoch_bar:
             if hasattr(self._train_sampler, "set_epoch"):
                 self._train_sampler.set_epoch(epoch)
 
             self.model.train()
-            train_metrics = self._run_epoch(self.train_loader, train=True)
+            train_metrics, global_step = self._run_epoch(
+                self.train_loader, train=True, epoch=epoch, global_step=global_step
+            )
 
             self.model.eval()
             with torch.no_grad():
-                val_metrics = self._run_epoch(self.val_loader, train=False)
+                val_metrics, _ = self._run_epoch(self.val_loader, train=False)
 
             metrics = {f"train/{k}": v for k, v in train_metrics.items()}
             metrics.update({f"val/{k}": v for k, v in val_metrics.items()})
@@ -406,11 +431,13 @@ class MDNRNNTrainer:
 
         return self.model.cpu()
 
-    def _run_epoch(self, loader: DataLoader, *, train: bool) -> dict[str, float]:
+    def _run_epoch(
+        self, loader: DataLoader, *, train: bool, epoch: int = 0, global_step: int = 0
+    ) -> tuple[dict[str, float], int]:
         totals: dict[str, float] = {"nll": 0.0, "done": 0.0, "total": 0.0}
         n = 0
         desc = "train" if train else "val"
-        for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not is_main()):
+        for step, batch in enumerate(tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not is_main())):
             z = batch["z"].to(self.device)
             a = batch["a"].to(self.device)
             z_next = batch["z_next"].to(self.device)
@@ -419,7 +446,6 @@ class MDNRNNTrainer:
             if train:
                 self.optimizer.zero_grad()
 
-            # hidden state is reset per batch (no TBPTT)
             out = self.model(z, a)
             losses = MDNRNN.mdn_loss(out, z_next, done)
 
@@ -433,8 +459,17 @@ class MDNRNNTrainer:
                 totals[k] += v.item() * bs
             n += bs
 
+            if train and is_main() and self.wandb_run is not None:
+                if (step + 1) % self.cfg.log_every_n_steps == 0:
+                    self.wandb_run.log({
+                        "step/nll":   losses["nll"].item(),
+                        "step/done":  losses["done"].item(),
+                        "step/total": losses["total"].item(),
+                        "global_step": global_step + step,
+                    })
+
         raw = {k: v / n for k, v in totals.items()}
-        return all_reduce_dict(raw, self.device)
+        return all_reduce_dict(raw, self.device), global_step + len(loader)
 
     def _save_checkpoint(
         self, epoch: int, metrics: dict[str, float], final: bool = False

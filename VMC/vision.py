@@ -91,13 +91,34 @@ class BaseVAE(nn.Module):
         output: VAEOutput,
         target: torch.Tensor,
         beta: float,
+        ssim_weight: float = 0.5,
     ) -> dict[str, torch.Tensor]:
         """
-        Beta-VAE loss: reconstruction (MSE) + beta * KL divergence.
+        Beta-VAE loss: reconstruction (MSE + SSIM) + beta * KL divergence.
 
-        Returns dict with keys: 'recon', 'kl', 'total'.
+        MSE = Gaussian pixel likelihood — correct for continuous [0,1] outputs.
+        BCE would be wrong here (that's for binary Bernoulli pixels).
+
+        Why add SSIM:
+            MSE weights all pixels equally — ~70% of CarRacing is green grass,
+            so the model minimises MSE by predicting green everywhere and ignoring
+            the track/road structure.
+            SSIM measures luminance, contrast, and local structure — a uniform
+            green prediction scores near 0 on SSIM regardless of the target,
+            forcing the model to reconstruct actual structure.
+
+        Total recon = MSE + ssim_weight * (1 - SSIM)
+
+        Returns dict with keys: 'mse', 'ssim', 'recon', 'kl', 'total'.
         """
-        recon_loss = F.mse_loss(output.recon, target, reduction="mean")
+        # MSE — Gaussian likelihood, correct for continuous pixels
+        mse_loss = F.mse_loss(output.recon, target, reduction="mean")
+
+        # SSIM — structural similarity, not fooled by dominant background colour
+        ssim_val = _ssim(output.recon, target)
+        ssim_loss = 1.0 - ssim_val   # convert to a loss (higher SSIM = lower loss)
+
+        recon_loss = mse_loss + ssim_weight * ssim_loss
 
         # KL( q(z|x) || p(z) ) — closed form for diagonal Gaussian
         kl_loss = -0.5 * torch.mean(
@@ -105,7 +126,47 @@ class BaseVAE(nn.Module):
         )
 
         total = recon_loss + beta * kl_loss
-        return {"recon": recon_loss, "kl": kl_loss, "total": total}
+        return {"mse": mse_loss, "ssim": ssim_val.detach(), "recon": recon_loss, "kl": kl_loss, "total": total}
+
+
+def _ssim(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    window_size: int = 11,
+    c1: float = 0.01 ** 2,
+    c2: float = 0.03 ** 2,
+) -> torch.Tensor:
+    """
+    Differentiable SSIM over a batch of images (B, C, H, W) in [0, 1].
+    Returns a scalar mean SSIM across the batch.
+
+    Uses a Gaussian-weighted local window (standard SSIM definition).
+    No external deps — pure PyTorch.
+    """
+    # Gaussian kernel
+    coords = torch.arange(window_size, dtype=x.dtype, device=x.device) - window_size // 2
+    g = torch.exp(-coords ** 2 / (2 * 1.5 ** 2))
+    g = g / g.sum()
+    kernel = g.outer(g)                              # (w, w)
+
+    B, C, H, W = x.shape
+    kernel = kernel.expand(C, 1, window_size, window_size)   # (C, 1, w, w)
+    pad = window_size // 2
+
+    mu_x  = F.conv2d(x, kernel, padding=pad, groups=C)
+    mu_y  = F.conv2d(y, kernel, padding=pad, groups=C)
+    mu_xx = F.conv2d(x * x, kernel, padding=pad, groups=C)
+    mu_yy = F.conv2d(y * y, kernel, padding=pad, groups=C)
+    mu_xy = F.conv2d(x * y, kernel, padding=pad, groups=C)
+
+    sigma_x  = mu_xx - mu_x ** 2
+    sigma_y  = mu_yy - mu_y ** 2
+    sigma_xy = mu_xy - mu_x * mu_y
+
+    num = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
+    den = (mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2)
+
+    return (num / den).mean()
 
 
 # ---------------------------------------------------------------------------
