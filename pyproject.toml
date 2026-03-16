@@ -1,0 +1,24 @@
+[project]
+name = "worldmodels"
+version = "0.1.0"
+description = "Notebook-first experiments and notes for world models."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "accelerate>=1.13.0",
+    "cma>=3.3.0",
+    "gymnasium[box2d]>=1.2.3",
+    "h5py>=3.16.0",
+    "ipykernel>=7.2.0",
+    "jupyterlab>=4.5.6",
+    "multiprocess>=0.70.18",
+    "numpy>=2.0.0",
+    "safetensors>=0.7.0",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "tqdm>=4.67.3",
+    "wandb>=0.19.0",
+]
+
+[tool.uv]
+package = false
