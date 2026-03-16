@@ -286,8 +286,21 @@ class FrameDataset(Dataset):
         frame = self._h5[ep_key]["frames"][ti]   # (3, H, W) float32
         return torch.from_numpy(frame)
 
+    # ------------------------------------------------------------------
+    # Pickle support for DataLoader num_workers > 0 (spawn context)
+    # h5py handles cannot be pickled — strip before fork, reopen after.
+    # ------------------------------------------------------------------
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_h5"] = None   # drop unpicklable handle
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._h5 = h5py.File(self._h5_path, "r", locking=False)
+
     def __del__(self) -> None:
-        if hasattr(self, "_h5") and self._h5.id.valid:
+        if hasattr(self, "_h5") and self._h5 is not None and self._h5.id.valid:
             self._h5.close()
 
 
