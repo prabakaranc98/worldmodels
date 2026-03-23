@@ -98,14 +98,15 @@ class WorldModel:
         mdn_ckpt = torch.load(mdn_path, map_location=device, weights_only=False)
         wm.mdn.load_state_dict(mdn_ckpt["model_state_dict"])
 
-        ctrl_ckpt = torch.load(ctrl_path, map_location=device, weights_only=False)
-        # controller checkpoint stores flat params (saved by CMAESTrainer)
-        if "model_state_dict" in ctrl_ckpt:
-            wm.ctrl.load_state_dict(ctrl_ckpt["model_state_dict"])
-        elif "params" in ctrl_ckpt:
-            wm.ctrl.set_params(ctrl_ckpt["params"])
-        else:
-            raise ValueError(f"Unrecognised controller checkpoint format in {ctrl_path}")
+        if ctrl_path and Path(ctrl_path).exists():
+            ctrl_ckpt = torch.load(ctrl_path, map_location=device, weights_only=False)
+            # controller checkpoint stores flat params (saved by CMAESTrainer)
+            if "model_state_dict" in ctrl_ckpt:
+                wm.ctrl.load_state_dict(ctrl_ckpt["model_state_dict"])
+            elif "params" in ctrl_ckpt:
+                wm.ctrl.set_params(ctrl_ckpt["params"])
+            else:
+                raise ValueError(f"Unrecognised controller checkpoint format in {ctrl_path}")
 
         return wm
 

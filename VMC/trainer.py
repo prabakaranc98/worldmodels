@@ -274,8 +274,9 @@ class VAETrainer:
             return   # only rank 0 writes checkpoints
         tag = "final" if final else f"epoch_{epoch+1:04d}"
         path = Path(self.cfg.checkpoint_dir) / f"vae_{tag}.pt"
-        # unwrap DDP/FSDP to get the raw module's state_dict
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(raw_model, "_orig_mod"):   # strip torch.compile wrapper
+            raw_model = raw_model._orig_mod
         torch.save(
             {
                 "model_state_dict": raw_model.state_dict(),
@@ -479,6 +480,8 @@ class MDNRNNTrainer:
         tag = "final" if final else f"epoch_{epoch+1:04d}"
         path = Path(self.cfg.checkpoint_dir) / f"mdn_{tag}.pt"
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(raw_model, "_orig_mod"):   # strip torch.compile wrapper
+            raw_model = raw_model._orig_mod
         torch.save(
             {
                 "model_state_dict": raw_model.state_dict(),

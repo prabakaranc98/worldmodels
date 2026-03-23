@@ -99,8 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sigma0", type=float, default=0.1)
     p.add_argument("--n_rollouts", type=int, default=16,
                    help="Rollouts averaged per CMA-ES candidate.")
-    p.add_argument("--n_envs", type=int, default=-1,
-                   help="AsyncVectorEnv workers for CMA-ES evaluation. -1 = os.cpu_count().")
+    p.add_argument("--n_envs", type=int, default=9999,
+                   help="Max rollouts per pool batch. 9999 = send all candidates at once to pool.")
     p.add_argument("--vae_ckpt", type=str, default=None,
                    help="VAE checkpoint for controller rollouts (auto-detected if omitted).")
     p.add_argument("--mdn_ckpt", type=str, default=None,
@@ -282,24 +282,6 @@ def phase_train_ctrl(args: argparse.Namespace) -> None:
     ctrl_cfg = _make_ctrl_cfg(args)
     ctrl = LinearController(ctrl_cfg)
 
-    # Build a picklable rollout function bound to the checkpoint paths
-    rollout_fn = _make_rollout_fn(
-        vae_ckpt=vae_ckpt,
-        mdn_ckpt=mdn_ckpt,
-        vae_cfg_kwargs=dict(
-            img_channels=3, img_size=args.img_size, z_dim=args.z_dim, beta=args.beta
-        ),
-        mdn_cfg_kwargs=dict(
-            z_dim=args.z_dim,
-            action_dim=args.action_dim,
-            hidden_size=args.hidden_size,
-            num_mixtures=args.num_mixtures,
-        ),
-        ctrl_cfg_kwargs=ctrl_cfg.__dict__.copy(),
-        env_id=args.env_id,
-        max_steps=args.max_steps,
-    )
-
     trainer = CMAESTrainer(
         ctrl_cfg, ctrl,
         vec_rollout_fn=_make_vec_rollout_fn(
@@ -318,6 +300,101 @@ def phase_train_ctrl(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-worker state (populated by _init_rollout_worker in each subprocess)
+# ---------------------------------------------------------------------------
+
+_WORKER_STATE: dict = {}
+
+
+def _init_rollout_worker(
+    vae_ckpt: str,
+    mdn_ckpt: str,
+    vae_cfg_kwargs: dict,
+    mdn_cfg_kwargs: dict,
+    img_size: int,
+) -> None:
+    """
+    Load VAE + MDN once per worker process.
+
+    Called by multiprocess.Pool(initializer=...) on spawn.
+    Results are cached in the module-level _WORKER_STATE dict so every
+    task handled by this worker reuses the same loaded models.
+    """
+    import torch
+    from VMC.memory import MDNRNN, MDNRNNConfig
+    from VMC.vision import BetaVAE, VAEConfig
+
+    device = torch.device("cpu")   # MPS is not fork-safe
+
+    vae = BetaVAE(VAEConfig(**vae_cfg_kwargs)).to(device).eval()
+    vc = torch.load(vae_ckpt, map_location=device, weights_only=False)
+    vae.load_state_dict(vc["model_state_dict"])
+
+    mdn_cfg = MDNRNNConfig(**mdn_cfg_kwargs)
+    mdn = MDNRNN(mdn_cfg).to(device).eval()
+    mc = torch.load(mdn_ckpt, map_location=device, weights_only=False)
+    mdn.load_state_dict(mc["model_state_dict"])
+
+    _WORKER_STATE["vae"] = vae
+    _WORKER_STATE["mdn"] = mdn
+    _WORKER_STATE["mdn_cfg"] = mdn_cfg
+    _WORKER_STATE["device"] = device
+    _WORKER_STATE["img_size"] = img_size
+
+
+def _eval_one_rollout(args: tuple) -> float:
+    """
+    Run a single episode with the given controller params.
+
+    Each call reuses the VAE+MDN loaded by _init_rollout_worker — no
+    per-call model loading overhead. The controller is tiny (linear layer)
+    and is rebuilt cheaply per call.
+
+    args: (params_flat, seed, env_id, max_steps, ctrl_cfg_kwargs)
+    Returns: total episode reward (float)
+    """
+    import gymnasium as gym
+    import torch
+    from VMC.controller import ControllerConfig, LinearController
+    from VMC.data import preprocess_frame
+
+    params_flat, seed, env_id, max_steps, ctrl_cfg_kwargs = args
+
+    vae      = _WORKER_STATE["vae"]
+    mdn      = _WORKER_STATE["mdn"]
+    mdn_cfg  = _WORKER_STATE["mdn_cfg"]
+    device   = _WORKER_STATE["device"]
+    img_size = _WORKER_STATE["img_size"]
+
+    ctrl = LinearController(ControllerConfig(**ctrl_cfg_kwargs)).to(device).eval()
+    ctrl.set_params(params_flat)
+
+    h, c = mdn.init_hidden(1, device)
+
+    env = gym.make(env_id)
+    obs, _ = env.reset(seed=seed)
+    total = 0.0
+
+    with torch.no_grad():
+        for _ in range(max_steps):
+            frame = preprocess_frame(obs, img_size).unsqueeze(0).to(device)
+            z  = vae(frame).mu                               # (1, z_dim)
+            h0 = h[0]                                        # (1, hidden_size)
+            a  = ctrl(z, h0)                                 # (1, action_dim)
+            mdn_out = mdn(z.unsqueeze(1), a.unsqueeze(1), hidden=(h, c))
+            h, c = mdn_out.h, mdn_out.c
+            obs, reward, terminated, truncated, _ = env.step(
+                a.squeeze(0).cpu().numpy()
+            )
+            total += float(reward)
+            if terminated or truncated:
+                break
+
+    env.close()
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Rollout function factory (module-level for pickling)
 # ---------------------------------------------------------------------------
 
@@ -329,16 +406,17 @@ def _make_vec_rollout_fn(
     ctrl_cfg_kwargs: dict,
 ):
     """
-    Return a vectorised rollout function for CMAESTrainer.
+    Return a rollout function for CMAESTrainer.
 
     Signature:
         vec_rollout_fn(params_list, seeds, env_id, n_envs, max_steps) → list[float]
 
-    Uses gymnasium.vector.AsyncVectorEnv — persistent env subprocesses shared
-    across all calls for a generation. Each call steps `n_envs` envs in parallel
-    with their respective controller params until all episodes are done.
+    Uses multiprocess.Pool (dill-based) for true parallel rollouts.
+    VAE+MDN are loaded once per worker via Pool initializer — no per-call
+    model loading overhead.
 
-    Dill (multiprocess) serialises the closure correctly on macOS/spawn.
+    Set n_envs large (e.g. 9999 via --n_envs) so CMAESTrainer sends all
+    candidates in one call; the pool handles batching internally.
     """
 
     def vec_rollout_fn(
@@ -348,65 +426,32 @@ def _make_vec_rollout_fn(
         n_envs: int,
         max_steps: int,
     ) -> list[float]:
-        import gymnasium as gym
-        import numpy as np
-        import torch
+        import os
+        import multiprocess as mp
 
-        from VMC.controller import ControllerConfig, LinearController
-        from VMC.memory import MDNRNN, MDNRNNConfig
-        from VMC.model import WorldModel, WorldModelConfig
-        from VMC.vision import BetaVAE, VAEConfig
+        img_size  = vae_cfg_kwargs.get("img_size", 64)
+        n_workers = min(len(params_list), n_envs if n_envs > 0 else (os.cpu_count() or 4))
 
-        # Build one WorldModel per env (each carries its own LSTM hidden state)
-        def make_wm(params_flat):
-            vae_cfg = VAEConfig(**vae_cfg_kwargs)
-            mdn_cfg = MDNRNNConfig(**mdn_cfg_kwargs)
-            ctrl_cfg = ControllerConfig(**ctrl_cfg_kwargs)
-            wm_cfg = WorldModelConfig(vae_cfg=vae_cfg, mdn_cfg=mdn_cfg, ctrl_cfg=ctrl_cfg)
-            wm = WorldModel.from_checkpoints(
-                vae_ckpt, mdn_ckpt,
-                ctrl_path=ctrl_cfg_kwargs.get("checkpoint_path", ""),
-                cfg=wm_cfg,
-            )
-            wm.ctrl.set_params(params_flat)
-            wm.ctrl.eval()
-            wm.reset()
-            return wm
+        task_args = [
+            (params, seed, env_id, max_steps, ctrl_cfg_kwargs)
+            for params, seed in zip(params_list, seeds)
+        ]
 
-        world_models = [make_wm(p) for p in params_list]
+        # timeout = generous upper bound per rollout (3× max_steps seconds)
+        timeout = max_steps * 3
 
-        # Persistent vectorised envs — no spawn overhead between candidates
-        envs = gym.vector.AsyncVectorEnv([
-            (lambda s=seeds[i]: lambda: gym.make(env_id))()   # one factory per env
-            for i in range(n_envs)
-        ])
+        with mp.Pool(
+            processes=n_workers,
+            initializer=_init_rollout_worker,
+            initargs=(vae_ckpt, mdn_ckpt, vae_cfg_kwargs, mdn_cfg_kwargs, img_size),
+        ) as pool:
+            try:
+                rewards = pool.map_async(_eval_one_rollout, task_args).get(timeout=timeout)
+            except mp.context.TimeoutError:
+                print(f"\n[warn] rollout batch timed out after {timeout}s — assigning -1000")
+                rewards = [-1000.0] * len(params_list)
 
-        obs_batch, _ = envs.reset(seed=seeds)  # (n_envs, H, W, C)
-        totals = [0.0] * n_envs
-        dones = [False] * n_envs
-
-        for _ in range(max_steps):
-            if all(dones):
-                break
-
-            actions = []
-            for i, (wm, obs) in enumerate(zip(world_models, obs_batch)):
-                if dones[i]:
-                    actions.append(envs.action_space.sample()[:1][0])  # dummy action
-                else:
-                    action, _, _ = wm.step(obs)
-                    actions.append(action)
-
-            obs_batch, rewards, terminated, truncated, _ = envs.step(np.array(actions))
-
-            for i in range(n_envs):
-                if not dones[i]:
-                    totals[i] += float(rewards[i])
-                    if terminated[i] or truncated[i]:
-                        dones[i] = True
-
-        envs.close()
-        return totals
+        return rewards
 
     return vec_rollout_fn
 
